@@ -1,0 +1,8 @@
+[build]
+cmds = ["cd backend && npm install"]
+
+[start]
+cmd = "cd backend && node src/app-simple.js"
+
+[variables]
+NODE_ENV = "production"
