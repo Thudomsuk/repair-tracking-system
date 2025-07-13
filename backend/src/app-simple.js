@@ -16,22 +16,66 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Mock data
+// Helper function to generate correct Job ID
+const generateJobId = () => {
+  const now = new Date();
+  const year = now.getFullYear().toString().substr(-2); // 25 (2025)
+  const month = (now.getMonth() + 1).toString().padStart(2, '0'); // 07 (July)
+  const day = now.getDate().toString().padStart(2, '0'); // 13
+  const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+  return `${year}${month}${day}${random}`;
+};
+
+// Mock data with proper timestamps
 let jobs = [
   {
-    jobId: "25010400001",
+    jobId: generateJobId(),
     customerName: "สมชาย ใจดี",
     customerPhone: "0812345678",
     deviceModel: "iPhone 14 Pro",
     problemDescription: "หน้าจอแตก",
-    status: "NEW_QUEUE",
+    status: "RECEIVED_AT_DROP",
     queueNumber: 1,
     priority: "NORMAL",
     createdAt: new Date(),
     updatedAt: new Date(),
-    dropAppId: "drop_app_001"
+    dropAppId: "drop_app_001",
+    history: [{
+      status: 'NEW_QUEUE',
+      updatedBy: 'system',
+      updatedByName: 'System',
+      timestamp: new Date(Date.now() - 30 * 60 * 1000), // 30 minutes ago
+      note: 'สร้างงานใหม่',
+      location: 'ONLINE'
+    }, {
+      status: 'RECEIVED_AT_DROP',
+      updatedBy: 'drop001',
+      updatedByName: 'Drop-APP Staff',
+      timestamp: new Date(),
+      note: 'รับเครื่องจากลูกค้าแล้ว',
+      location: 'DROP_APP'
+    }]
   }
 ];
+
+// Counter for queue numbers (reset daily)
+let dailyCounter = jobs.length;
+let lastResetDate = new Date().toDateString();
+
+// Function to get next queue number (resets daily)
+const getNextQueueNumber = () => {
+  const today = new Date().toDateString();
+  
+  // Reset counter if it's a new day
+  if (today !== lastResetDate) {
+    dailyCounter = 0;
+    lastResetDate = today;
+    // In real app, we would also clear old jobs or move to history
+  }
+  
+  dailyCounter++;
+  return dailyCounter;
+};
 
 // Health check
 app.get('/health', (req, res) => {
@@ -52,23 +96,48 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/health',
       jobs: '/api/jobs',
-      stats: '/api/jobs/stats/summary'
+      stats: '/api/jobs/stats/summary',
+      queue: '/api/jobs/queue/current'
     }
   });
 });
 
-// Get all jobs
+// Get all jobs with filtering
 app.get('/api/jobs', (req, res) => {
-  res.json({
-    success: true,
-    data: jobs,
-    pagination: {
-      page: 1,
-      limit: 20,
-      total: jobs.length,
-      totalPages: 1
+  try {
+    const { status, limit = 20 } = req.query;
+    
+    let filteredJobs = jobs;
+    
+    // Filter by status if provided
+    if (status && status !== '' && status !== 'all') {
+      filteredJobs = jobs.filter(job => job.status === status);
     }
-  });
+    
+    // Apply limit
+    const limitedJobs = filteredJobs.slice(0, parseInt(limit));
+    
+    res.json({
+      success: true,
+      data: limitedJobs,
+      pagination: {
+        page: 1,
+        limit: parseInt(limit),
+        total: filteredJobs.length,
+        totalPages: Math.ceil(filteredJobs.length / parseInt(limit))
+      },
+      filter: {
+        status: status || 'all',
+        applied: status ? true : false
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching jobs:', error);
+    res.status(500).json({
+      success: false,
+      message: 'เกิดข้อผิดพลาดในการดึงข้อมูล'
+    });
+  }
 });
 
 // Create new job
@@ -79,10 +148,12 @@ app.post('/api/jobs', (req, res) => {
       customerPhone,
       customerEmail,
       deviceModel,
+      deviceSerial,
       problemDescription,
       problemCategory,
       priority = 'NORMAL',
-      dropAppId
+      dropAppId,
+      source = 'ONLINE'
     } = req.body;
 
     // Validation
@@ -93,27 +164,41 @@ app.post('/api/jobs', (req, res) => {
       });
     }
 
+    const jobId = generateJobId();
+    const queueNumber = getNextQueueNumber();
+    const now = new Date();
+
     const newJob = {
-      jobId: `2501040000${jobs.length + 1}`,
+      jobId,
       customerName,
       customerPhone,
       customerEmail: customerEmail || null,
       deviceModel,
+      deviceSerial: deviceSerial || null,
       problemDescription,
       problemCategory: problemCategory || 'OTHER',
       status: "NEW_QUEUE",
       priority,
-      queueNumber: jobs.length + 1,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      queueNumber,
+      createdAt: now,
+      updatedAt: now,
       dropAppId: dropAppId || 'drop_app_001',
       estimatedCost: 0,
-      actualCost: 0
+      actualCost: 0,
+      source,
+      history: [{
+        status: 'NEW_QUEUE',
+        updatedBy: 'system',
+        updatedByName: 'System',
+        timestamp: now,
+        note: 'สร้างงานใหม่จากการลงทะเบียนออนไลน์',
+        location: source
+      }]
     };
 
     jobs.push(newJob);
 
-    console.log(`✅ Created job: ${newJob.jobId} for ${customerName}`);
+    console.log(`✅ Created job: ${newJob.jobId} for ${customerName} (Queue: ${queueNumber})`);
 
     res.status(201).json({
       success: true,
@@ -137,7 +222,7 @@ app.post('/api/jobs', (req, res) => {
 app.put('/api/jobs/:id', (req, res) => {
   try {
     const { id } = req.params;
-    const { status, note } = req.body;
+    const { status, note, updatedBy = 'system', updatedByName = 'System User' } = req.body;
 
     const jobIndex = jobs.findIndex(j => j.jobId === id);
     if (jobIndex === -1) {
@@ -149,9 +234,22 @@ app.put('/api/jobs/:id', (req, res) => {
 
     const job = jobs[jobIndex];
     const oldStatus = job.status;
+    const now = new Date();
     
+    // Update job
     job.status = status;
-    job.updatedAt = new Date();
+    job.updatedAt = now;
+
+    // Add to history
+    if (!job.history) job.history = [];
+    job.history.push({
+      status,
+      updatedBy,
+      updatedByName,
+      timestamp: now,
+      note: note || `เปลี่ยนสถานะจาก ${oldStatus} เป็น ${status}`,
+      location: 'API'
+    });
 
     console.log(`✅ Updated job ${id}: ${oldStatus} → ${status}`);
 
@@ -161,7 +259,8 @@ app.put('/api/jobs/:id', (req, res) => {
       data: {
         jobId: job.jobId,
         oldStatus,
-        newStatus: status
+        newStatus: status,
+        updatedAt: now
       }
     });
   } catch (error) {
@@ -200,6 +299,11 @@ app.get('/api/jobs/stats/summary', (req, res) => {
   ).length;
   const pending = jobs.filter(job => job.status === 'NEW_QUEUE').length;
 
+  // Calculate proper percentages
+  const completionRate = total > 0 ? Math.round((completed / total) * 100) : 0;
+  const inProgressRate = total > 0 ? Math.round((inProgress / total) * 100) : 0;
+  const pendingRate = total > 0 ? Math.round((pending / total) * 100) : 0;
+
   res.json({
     success: true,
     data: {
@@ -208,19 +312,21 @@ app.get('/api/jobs/stats/summary', (req, res) => {
       inProgress,
       pending,
       avgCompletionTime: 2,
-      completionRate: total > 0 ? Math.round((completed / total) * 100) : 0,
+      completionRate,
+      inProgressRate,
+      pendingRate,
       statusBreakdown: {
         NEW_QUEUE: pending,
-        RECEIVED_AT_DROP: Math.floor(total * 0.2),
-        TRANSFERRING_TO_ASP: Math.floor(total * 0.1),
-        RECEIVED_AT_ASP: Math.floor(total * 0.1),
-        EVALUATING: Math.floor(total * 0.1),
-        WAITING_PARTS: 0,
-        REPAIRING: inProgress,
-        QUALITY_CHECK: 0,
-        READY_FOR_RETURN: 0,
-        RETURNED_TO_DROP: 0,
-        READY_FOR_PICKUP: 0,
+        RECEIVED_AT_DROP: jobs.filter(j => j.status === 'RECEIVED_AT_DROP').length,
+        TRANSFERRING_TO_ASP: jobs.filter(j => j.status === 'TRANSFERRING_TO_ASP').length,
+        RECEIVED_AT_ASP: jobs.filter(j => j.status === 'RECEIVED_AT_ASP').length,
+        EVALUATING: jobs.filter(j => j.status === 'EVALUATING').length,
+        WAITING_PARTS: jobs.filter(j => j.status === 'WAITING_PARTS').length,
+        REPAIRING: jobs.filter(j => j.status === 'REPAIRING').length,
+        QUALITY_CHECK: jobs.filter(j => j.status === 'QUALITY_CHECK').length,
+        READY_FOR_RETURN: jobs.filter(j => j.status === 'READY_FOR_RETURN').length,
+        RETURNED_TO_DROP: jobs.filter(j => j.status === 'RETURNED_TO_DROP').length,
+        READY_FOR_PICKUP: jobs.filter(j => j.status === 'READY_FOR_PICKUP').length,
         COMPLETED: completed
       },
       currentQueue: total,
@@ -229,30 +335,39 @@ app.get('/api/jobs/stats/summary', (req, res) => {
   });
 });
 
-// Get current queue
+// Get current queue with proper time calculation
 app.get('/api/jobs/queue/current', (req, res) => {
   const queueJobs = jobs
     .filter(job => ['NEW_QUEUE', 'RECEIVED_AT_DROP'].includes(job.status))
-    .slice(0, 10)
-    .map(job => ({
+    .sort((a, b) => a.queueNumber - b.queueNumber)
+    .slice(0, 10);
+
+  // Generate proper estimated times
+  const queueWithTimes = queueJobs.map((job, index) => {
+    const baseTime = new Date();
+    const estimatedMinutes = (index + 1) * 30; // 30 minutes per queue position
+    const estimatedTime = new Date(baseTime.getTime() + estimatedMinutes * 60000);
+    
+    return {
       queueNumber: job.queueNumber,
       jobId: job.jobId,
       customerName: job.customerName,
       status: job.status,
-      estimatedTime: new Date(Date.now() + 2 * 60 * 60 * 1000).toLocaleTimeString('th-TH', {
+      estimatedTime: estimatedTime.toLocaleTimeString('th-TH', {
         hour: '2-digit',
         minute: '2-digit'
       })
-    }));
+    };
+  });
 
   res.json({
     success: true,
     data: {
-      currentQueue: jobs.length,
+      currentQueue: Math.max(...jobs.map(j => j.queueNumber), 0),
       totalToday: jobs.length,
       averageWaitTime: 30,
       lastUpdated: new Date(),
-      queueList: queueJobs
+      queueList: queueWithTimes
     }
   });
 });
@@ -266,6 +381,13 @@ app.get('/api/jobs/analytics/overview', (req, res) => {
     pending: jobs.filter(job => job.status === 'NEW_QUEUE').length
   };
 
+  // Calculate realistic growth percentages
+  const getGrowthPercentage = (current, category) => {
+    const base = Math.max(current - 2, 0); // Simulate previous period
+    if (base === 0) return current > 0 ? 100 : 0;
+    return Math.round(((current - base) / base) * 100);
+  };
+
   res.json({
     success: true,
     data: {
@@ -276,21 +398,59 @@ app.get('/api/jobs/analytics/overview', (req, res) => {
         pendingJobs: stats.pending,
         avgCompletionTime: 2,
         completionRate: stats.total > 0 ? Math.round((stats.completed / stats.total) * 100) : 0,
-        currentQueue: stats.total,
+        currentQueue: Math.max(...jobs.map(j => j.queueNumber), 0),
         todayJobs: stats.total,
         statusBreakdown: {
           NEW_QUEUE: stats.pending,
+          RECEIVED_AT_DROP: jobs.filter(j => j.status === 'RECEIVED_AT_DROP').length,
+          TRANSFERRING_TO_ASP: jobs.filter(j => j.status === 'TRANSFERRING_TO_ASP').length,
+          RECEIVED_AT_ASP: jobs.filter(j => j.status === 'RECEIVED_AT_ASP').length,
+          EVALUATING: jobs.filter(j => j.status === 'EVALUATING').length,
+          WAITING_PARTS: jobs.filter(j => j.status === 'WAITING_PARTS').length,
+          REPAIRING: jobs.filter(j => j.status === 'REPAIRING').length,
+          QUALITY_CHECK: jobs.filter(j => j.status === 'QUALITY_CHECK').length,
+          READY_FOR_RETURN: jobs.filter(j => j.status === 'READY_FOR_RETURN').length,
+          RETURNED_TO_DROP: jobs.filter(j => j.status === 'RETURNED_TO_DROP').length,
+          READY_FOR_PICKUP: jobs.filter(j => j.status === 'READY_FOR_PICKUP').length,
           COMPLETED: stats.completed
         }
       },
       trends: {
-        jobsGrowth: 12.5,
-        revenueGrowth: 18.3,
-        completionGrowth: 8.7,
-        efficiencyGrowth: 5.2
+        jobsGrowth: getGrowthPercentage(stats.total, 'jobs'),
+        revenueGrowth: getGrowthPercentage(stats.completed * 2500, 'revenue'),
+        completionGrowth: getGrowthPercentage(stats.completed, 'completion'),
+        efficiencyGrowth: stats.total > 0 ? Math.round((stats.completed / stats.total) * 10) : 0
       },
       lastUpdated: new Date()
     }
+  });
+});
+
+// Daily analytics
+app.get('/api/jobs/analytics/daily', (req, res) => {
+  const days = 7;
+  const dailyStats = [];
+
+  for (let i = days - 1; i >= 0; i--) {
+    const date = new Date();
+    date.setDate(date.getDate() - i);
+    const dateStr = date.toISOString().split('T')[0];
+
+    // Mock daily data based on current jobs
+    const dayJobCount = Math.max(1, Math.floor(jobs.length / days) + Math.floor(Math.random() * 3));
+    const completedCount = Math.floor(dayJobCount * 0.6);
+    
+    dailyStats.push({
+      date: dateStr,
+      created: dayJobCount,
+      completed: completedCount,
+      revenue: completedCount * 2500
+    });
+  }
+
+  res.json({
+    success: true,
+    data: dailyStats
   });
 });
 
@@ -318,6 +478,7 @@ app.listen(PORT, () => {
   console.log('🚀 Repair Tracking API running on port', PORT);
   console.log('📱 Health check: http://localhost:' + PORT + '/health');
   console.log('🌍 Environment:', process.env.NODE_ENV || 'development');
+  console.log('📅 Today is:', new Date().toLocaleDateString('th-TH'));
 });
 
 module.exports = app;
